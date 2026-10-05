@@ -3,21 +3,9 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: production
-  cancel-in-progress: false
-
 permissions:
   id-token: write
   contents: read
-
-env:
-  PYTHON_VERSION: "3.12"
-  AWS_REGION: "ap-south-1"
-  S3_BUCKET: "platform-deploy-artifacts"
-  EC2_INSTANCE_ID: "i-0059a2e17b3c9d384"
-  SSM_DOCUMENT: "Platform-Deploy"
-  ALB_HEALTH_URL: "https://platform.example.com/health/ready/"
 
 jobs:
   test:
@@ -40,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
       - run: |
@@ -56,40 +44,17 @@ jobs:
           DB_PASSWORD: "ci_test_password_only"
           DB_SSLMODE: "disable"
 
-  deploy:
+  aws-auth:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::703983099689:role/GitHubActionsDeployRole
-          aws-region: ${{ env.AWS_REGION }}
-      - run: tar -czf "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" --exclude='.git' .
-      - run: aws s3 cp "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" "s3://${{ env.S3_BUCKET }}/releases/${{ steps.vars.outputs.sha_short }}.tar.gz"
-      - id: ssm_deploy
+          aws-region: ap-south-1
+      - name: Verify Authentication
         run: |
-          COMMAND_ID=$(aws ssm send-command \
-            --document-name "${{ env.SSM_DOCUMENT }}" \
-            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
-            --parameters "CommitSha=${{ steps.vars.outputs.sha_short }},S3Uri=s3://${{ env.S3_BUCKET }}/releases/${{ steps.vars.outputs.sha_short }}.tar.gz" \
-            --timeout-seconds 300 \
-            --output text --query "Command.CommandId")
-          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${{ env.EC2_INSTANCE_ID }}"
-      - run: |
-          for i in $(seq 1 5); do
-            HTTP_CODE=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "${{ env.ALB_HEALTH_URL }}" || echo "000")
-            if [ "${HTTP_CODE}" = "200" ]; then exit 0; fi
-            sleep 10
-          done
-          exit 1
-      - if: failure() && steps.ssm_deploy.outcome == 'success'
-        run: |
-          echo "Initiating SSM rollback..."
-          R_COMMAND_ID=$(aws ssm send-command \
-            --document-name "${{ env.SSM_DOCUMENT }}-Rollback" \
-            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
-            --output text --query "Command.CommandId")
-          aws ssm wait command-executed --command-id "${R_COMMAND_ID}" --instance-id "${{ env.EC2_INSTANCE_ID }}"
+          echo "✅ Successfully authenticated to AWS using OIDC!"
+          aws sts get-caller-identity
