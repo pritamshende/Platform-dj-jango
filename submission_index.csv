@@ -1,0 +1,11 @@
+Part,Topic,Description,File / Deliverable Reference
+Part 1,Deployment Approach,Written explanation of EC2 deployment approach including server setup and app config,SOLUTION.md (Section 1)
+Part 1,Nginx Config,Sample Nginx reverse proxy configuration,ops/platform-nginx.conf
+Part 1,Systemd Service,Sample Systemd unit file for Gunicorn,ops/platform.service
+Part 1,Deployment Script,Server-side bash script for pulling artifacts and atomic symlink deployment,ops/deploy.sh
+Part 1,Django Settings,Production-ready Django settings (env-var driven),config/settings.py
+Part 2,CI/CD Pipeline,GitHub Actions workflow (test build upload to S3 SSM deploy and verify),.github/workflows/deploy.yml
+Part 3,Incident Investigation,Step-by-step troubleshooting guide for 502 Bad Gateway errors,SOLUTION.md (Section 3)
+Part 4,Security Review,Identification of 12 security risks and their remediations,SOLUTION.md (Section 4)
+Part 5,Health-Check Endpoint,Django code for liveness and database readiness probes,config/health.py
+Part 6,AWS Architecture,Detailed AWS architecture breakdown and text-based diagram,SOLUTION.md (Section 6)

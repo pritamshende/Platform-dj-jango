@@ -1,0 +1,96 @@
+name: Deploy Platform
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  AWS_REGION: "ap-south-1"
+  S3_BUCKET: "platform-deploy-artifacts"
+  EC2_INSTANCE_ID: "i-0xxxxxxxxxxxx"
+  SSM_DOCUMENT: "Platform-Deploy"
+  ALB_HEALTH_URL: "https://platform.example.com/health/ready/"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platform_test
+          POSTGRES_USER: platform_test
+          POSTGRES_PASSWORD: ci_test_password_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U platform_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: |
+          python manage.py check
+          python manage.py test
+        env:
+          DJANGO_SECRET_KEY: "test-secret-key"
+          DJANGO_DEBUG: "True"
+          DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,testserver"
+          DB_HOST: "localhost"
+          DB_NAME: "platform_test"
+          DB_USER: "platform_test"
+          DB_PASSWORD: "ci_test_password_only"
+          DB_SSLMODE: "disable"
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+      - run: tar -czf "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" --exclude='.git' .
+      - run: aws s3 cp "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" "s3://${{ env.S3_BUCKET }}/releases/${{ steps.vars.outputs.sha_short }}.tar.gz"
+      - id: ssm_deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "${{ env.SSM_DOCUMENT }}" \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --parameters "CommitSha=${{ steps.vars.outputs.sha_short }},S3Uri=s3://${{ env.S3_BUCKET }}/releases/${{ steps.vars.outputs.sha_short }}.tar.gz" \
+            --timeout-seconds 300 \
+            --output text --query "Command.CommandId")
+          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${{ env.EC2_INSTANCE_ID }}"
+      - run: |
+          for i in $(seq 1 5); do
+            HTTP_CODE=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "${{ env.ALB_HEALTH_URL }}" || echo "000")
+            if [ "${HTTP_CODE}" = "200" ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+      - if: failure() && steps.ssm_deploy.outcome == 'success'
+        run: |
+          echo "Initiating SSM rollback..."
+          R_COMMAND_ID=$(aws ssm send-command \
+            --document-name "${{ env.SSM_DOCUMENT }}-Rollback" \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --output text --query "Command.CommandId")
+          aws ssm wait command-executed --command-id "${R_COMMAND_ID}" --instance-id "${{ env.EC2_INSTANCE_ID }}"

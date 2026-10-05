@@ -1,0 +1,15 @@
+# Core framework
+Django==5.2
+gunicorn==23.0.0
+
+# Database
+psycopg2-binary==2.9.10
+
+# Security
+django-cors-headers==4.6.0
+
+# Monitoring
+django-health-check==3.18.3
+
+# Environment management
+python-decouple==3.8

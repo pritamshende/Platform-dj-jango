@@ -1,0 +1,38 @@
+# ============================================================================
+# Systemd unit file for the Platform Django application
+# Install to: /etc/systemd/system/platform.service
+# ============================================================================
+
+[Unit]
+Description=Platform Django Application (Gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=platform
+Group=platform
+WorkingDirectory=/opt/platform/current
+EnvironmentFile=/etc/platform/platform.env
+
+ExecStart=/opt/platform/current/.venv/bin/gunicorn \
+    config.wsgi:application \
+    --bind 127.0.0.1:8000 \
+    --workers 2 \
+    --timeout 30 \
+    --access-logfile - \
+    --error-logfile -
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/platform
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
