@@ -8,6 +8,8 @@
 ---
 
 ## Executive Summary
+
+**Status:** The demo checks listed below are candidate-reported. The CI/CD workflow and production infrastructure are proposed; they have not been validated by this document review.
 This document serves as the complete submission for the Platform Engineer Technical Assignment. It covers the end-to-end deployment strategy, CI/CD pipeline design, incident troubleshooting protocols, security analysis, health-check implementation, and AWS architecture. 
 
 A live demonstration environment has been provisioned on EC2. All deliverables comply with the requirement of omitting confidential company information or hardcoded credentials. 
@@ -16,7 +18,7 @@ A live demonstration environment has been provisioned on EC2. All deliverables c
 
 ## Part 1: Deployment Approach & Execution
 
-The application uses an immutable deployment strategy. Each deployment creates a new, isolated directory containing a fresh Python virtual environment. The application is served by Gunicorn running as a `systemd` service, with Nginx acting as a reverse proxy. 
+The deployment design uses separate release directories. Each deployment creates a new, isolated directory containing a fresh Python virtual environment. The application is served by Gunicorn running as a `systemd` service, with Nginx acting as a reverse proxy. 
 
 ### 1.1 Live Environment Setup Commands
 The following commands were executed to provision the live Ubuntu EC2 instance. **The demonstration uses local PostgreSQL. The production design uses private RDS PostgreSQL.** Additionally, in the demo configuration, Nginx serves traffic directly over HTTP. In the proposed production architecture, HTTPS terminates at the ALB, which forwards HTTP to Nginx.
@@ -24,7 +26,7 @@ The following commands were executed to provision the live Ubuntu EC2 instance. 
 **1. System Packages & User Setup:**
 ```bash
 sudo apt update
-sudo apt install -y python3-venv python3-pip nginx postgresql postgresql-client curl jq libpq-dev python3-dev build-essential
+sudo apt install -y python3-venv python3-pip nginx postgresql postgresql-client curl jq rsync libpq-dev python3-dev build-essential
 sudo useradd --system --home /opt/platform --shell /usr/sbin/nologin platform
 ```
 
@@ -57,6 +59,8 @@ Runtime configuration is loaded from `/etc/platform/platform.env`. Root ownershi
 **5. Application Server & Proxy Configuration:**
 *   **Gunicorn:** Managed via `systemd` (`ops/platform.service`), running under the restricted `platform` user.
 *   **Nginx (Demo Configuration):** Configured (`ops/platform-nginx.conf`) to proxy traffic to Gunicorn on port 8000, and serve static assets directly from `/var/lib/platform/static`. Behind an HTTPS ALB in production, Nginx would use the trusted `X-Forwarded-Proto` header, and Django would configure `SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')`.
+
+**Deployment prerequisites:** Install AWS CLI v2 and verify `aws --version` before using the S3 deployment script. Install the service unit and Nginx site, disable the distribution default Nginx site if it conflicts, and create the initial release/current symlink before starting the service. The maintenance script requires administrator privileges; the application service runs as `platform`.
 
 **6. Service Startup:**
 ```bash
@@ -125,7 +129,7 @@ A comprehensive CI/CD pipeline was designed using **GitHub Actions** (see detail
     * Database migrations (`manage.py migrate`)
     * Application restart (`systemctl restart platform`)
 6.  **Verification:** The pipeline pings the ALB health endpoint and explicitly waits for a `Success` status.
-7.  **Automated Rollback:** If deployment or verification fails, the pipeline explicitly waits for the `Platform-Deploy-Rollback` SSM command to complete.
+7.  **Rollback:** The deployment script handles service-restart failures and failed local readiness checks. If SSM deployment succeeds but external verification fails, the pipeline invokes `Platform-Deploy-Rollback` and waits for its result. If the SSM waiter fails or times out, investigate the remote command status before further changes; the example pipeline stops rather than starting a concurrent rollback.
 
 *Known Pipeline Limitations:*
 - **SSM Timeout:** A waiter timeout does not prove the remote deployment actually stopped. The pipeline must inspect the remote status before issuing another deployment or rollback.
@@ -162,7 +166,7 @@ namei -l /opt/platform/current/.venv/bin/gunicorn
 **4. Upstream Checks (Wrong Upstream Port):**
 ```bash
 sudo ss -lntp | grep 8000
-curl -s http://127.0.0.1:8000/health/live/
+curl -i --connect-timeout 3 --max-time 5 -H "Host: platform.example.com" http://127.0.0.1:8000/health/live/
 ```
 *Cause:* Gunicorn binds to an unexpected port or interface, causing Nginx proxy passes to time out or fail.
 
@@ -176,19 +180,19 @@ If the issue was introduced by a recent deployment, perform a compatible rollbac
 The following operational and security controls are defined for this architecture. 
 
 **Implemented Controls (Live Demo):**
-1.  **Application running as root:** Mitigated by creating a dedicated `platform` user with a `nologin` shell. Gunicorn processes drop root privileges.
+1.  **Application running as root:** Mitigated by creating a dedicated `platform` user with a `nologin` shell. systemd starts Gunicorn directly under this account.
 2.  **Weak Linux permissions:** `systemd` unit hardened with `NoNewPrivileges=true`, `ProtectSystem=strict`, and `PrivateTmp=true`.
 3.  **Secrets stored in source code:** Excluded from git; injected securely via `/etc/platform/platform.env`.
 4.  **Debug mode enabled:** `DJANGO_DEBUG` is forced to `False`. 
 
 **Proposed Production Controls (Not Deployed in Demo):**
 5.  **Overly permissive IAM access:** Segment IAM roles (GitHub OIDC vs. EC2 Profile) adhering to the principle of least privilege.
-    * *GitHub OIDC Role:* Permitted to push to S3 and trigger SSM Run Command.
-    * *EC2 Instance Role:* Permitted to pull from the S3 artifact bucket and write logs to CloudWatch.
+    * *GitHub OIDC Role:* Permitted to upload to the designated S3 artifact prefix, invoke only the approved SSM documents on intended instances, and inspect command results using `ssm:GetCommandInvocation`. The OIDC trust policy strictly limits access to the repository (`pritamshende/Platform-dj-jango`) and the GitHub deployment environment (`production`).
+    * *EC2 Instance Role:* Permitted to download from the designated S3 artifact prefix, write the intended CloudWatch logs/metrics, and use Systems Manager through the required managed-instance permissions. Private instances need service connectivity through VPC endpoints or an appropriate outbound path.
 6.  **Open security group ports:** Disable SSH (port 22) from the internet. Administration handled via AWS SSM Session Manager.
 7.  **Publicly exposed database:** The production RDS instance will reside in a private subnet. 
-    * *Security Group Inbound Rules:* ALB SG allows `443` from `0.0.0.0/0`. EC2 SG allows `80` from ALB SG. RDS SG allows `5432` from EC2 SG.
-8.  **Missing SSL:** For the proposed architecture, HTTPS terminates at the ALB. An ACM certificate is requested, validated via Route 53 DNS, attached to the ALB HTTPS listener, and a rule is added to redirect all HTTP (port 80) traffic to HTTPS (port 443). The ALB then forwards the secure traffic over HTTP to Nginx.
+    * *Security Group Inbound Rules:* ALB SG allows `443` from approved client networks (or `0.0.0.0/0` only when public access is intended), plus `80` from the same sources solely for HTTPS redirection. EC2 SG allows `80` from ALB SG. RDS SG allows `5432` from EC2 SG.
+8.  **Missing SSL:** For the proposed architecture, HTTPS terminates at the ALB. An ACM certificate is requested, validated via Route 53 DNS, attached to the ALB HTTPS listener, and a rule is added to redirect all HTTP (port 80) traffic to HTTPS (port 443). The ALB then forwards decrypted HTTP traffic to Nginx within the VPC; this leg is not encrypted. Use HTTPS target connections if end-to-end transport encryption is required.
 
 ---
 
@@ -235,18 +239,18 @@ def ready(request):
 
 #### View 1: Live Demo
 ```mermaid
-flowchart LR
-    User([User]) -->|HTTP Port 80| Nginx[Nginx Proxy\non EC2]
-    Nginx -->|HTTP 127.0.0.1:8000| Gunicorn[Gunicorn App\non EC2]
-    Gunicorn -->|Local TCP 5432| DB[(Local PostgreSQL\non EC2)]
+flowchart TB
+    User([User]) -->|HTTP Port 80| Nginx[Nginx Proxy — on EC2]
+    Nginx -->|HTTP 127.0.0.1:8000| Gunicorn[Gunicorn App — on EC2]
+    Gunicorn -->|Local TCP 5432| DB[(Local PostgreSQL — on EC2)]
 ```
 
 #### View 2: Proposed Production
 ```mermaid
-flowchart LR
+flowchart TB
     User([User]) -.->|DNS Alias Lookup| Route53{Route 53 DNS}
     Route53 -.->|Alias| ALB
-    User -->|HTTPS Port 443| ALB[Application Load Balancer\nPublic Subnets AZ-A & AZ-B]
+    User -->|HTTPS Port 443| ALB[Application Load Balancer — Public Subnets AZ-A & AZ-B]
     
     subgraph "Private Subnet (AZ-A)"
       subgraph EC2_A [EC2 Instance A]
@@ -264,7 +268,7 @@ flowchart LR
     ALB -->|HTTP Port 80| EC2_B
     
     subgraph "Private Subnets (Multi-AZ)"
-      RDS[(RDS PostgreSQL Primary\nAZ-A)] -.- RDS_Standby[(RDS Standby\nAZ-B)]
+      RDS[(RDS PostgreSQL Primary — AZ-A)] -.- RDS_Standby[(RDS Standby — AZ-B)]
     end
 
     GunicornA -->|TCP 5432| RDS
@@ -464,13 +468,15 @@ perform_rollback() {
         log "Rolling back to ${PREVIOUS_RELEASE}..."
         ln -sfn "${PREVIOUS_RELEASE}" "${CURRENT_LINK}"
         systemctl restart platform || fail "Rollback restart failed!"
-        sleep 3
-        RB_HTTP=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" -H "Host: platform.example.com" "${HEALTH_URL}" 2>/dev/null || echo "000")
-        if [ "${RB_HTTP}" = "200" ]; then
-            log "Rollback completed and healthy."
-        else
-            fail "CRITICAL: Rollback completed but is failing health checks (HTTP ${RB_HTTP})."
-        fi
+        for attempt in $(seq 1 10); do
+            RB_HTTP=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" -H "Host: platform.example.com" "${HEALTH_URL}" 2>/dev/null || true)
+            if [ "${RB_HTTP}" = "200" ]; then
+                log "Rollback completed and healthy."
+                return 0
+            fi
+            sleep 3
+        done
+        fail "CRITICAL: Previous release did not become healthy after rollback."
     else
         fail "Cannot rollback: No valid previous release."
     fi
@@ -599,8 +605,33 @@ jobs:
           aws ssm wait command-executed --command-id "${R_COMMAND_ID}" --instance-id "${{ env.EC2_INSTANCE_ID }}"
 ```
 
-### E. SSM Prerequisites (To be implemented)
-*(These AWS Systems Manager Documents are prerequisites to the pipeline and must be created in AWS).*
+### E. AWS Prerequisites (To be implemented)
+
+#### 1. GitHub OIDC IAM Trust Policy
+*(Required for GitHub Actions to authenticate into the AWS Account for the `production` environment).*
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<AWS_ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:pritamshende/Platform-dj-jango:environment:production"
+        }
+      }
+    }
+  ]
+}
+```
+
+#### 2. SSM Documents
+*(These AWS Systems Manager Documents are prerequisites to the pipeline).*
 
 **`Platform-Deploy` Document:**
 Runs the shell script `/opt/platform/deploy.sh {{CommitSha}} {{S3Uri}}`.
