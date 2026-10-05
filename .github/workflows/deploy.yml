@@ -15,7 +15,7 @@ env:
   PYTHON_VERSION: "3.12"
   AWS_REGION: "ap-south-1"
   S3_BUCKET: "platform-deploy-artifacts"
-  EC2_INSTANCE_ID: "i-0xxxxxxxxxxxx"
+  EC2_INSTANCE_ID: "i-0059a2e17b3c9d384"
   SSM_DOCUMENT: "Platform-Deploy"
   ALB_HEALTH_URL: "https://platform.example.com/health/ready/"
 
