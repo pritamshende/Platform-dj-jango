@@ -59,14 +59,13 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-    environment: production
     steps:
       - uses: actions/checkout@v4
       - id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          role-to-assume: arn:aws:iam::703983099689:role/GitHubActionsDeployRole
           aws-region: ${{ env.AWS_REGION }}
       - run: tar -czf "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" --exclude='.git' .
       - run: aws s3 cp "/tmp/${{ steps.vars.outputs.sha_short }}.tar.gz" "s3://${{ env.S3_BUCKET }}/releases/${{ steps.vars.outputs.sha_short }}.tar.gz"
